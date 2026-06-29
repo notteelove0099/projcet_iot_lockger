@@ -40,14 +40,14 @@ void sendPhotoToServer(camera_fb_t * fb, String locker, String eventId) {
   
   // แนบตัวแปร lockerId และ eventId ไปต่อท้าย URL (Query String)
   String url = String(SERVER_UPLOAD_URL) + "?lockerId=" + locker + "&eventId=" + eventId;
-
+  
   http.begin(url);
   http.addHeader("Content-Type", "image/jpeg");
   http.addHeader("x-api-key", ESP32_API_KEY);
 
   // ส่งข้อมูลภาพเป็นไฟล์ดิบ (Binary) โยนทีเดียวจบ!
   int httpResponseCode = http.POST(fb->buf, fb->len);
-
+  
   if (httpResponseCode > 0) {
     Serial.printf("📸 ส่งรูปไป Server สำเร็จ! (HTTP %d)\n", httpResponseCode);
   } else {
@@ -64,7 +64,16 @@ void handleCapture() {
   String locker = server.hasArg("locker") ? server.arg("locker") : "UNKNOWN";
   String eventId = server.hasArg("eventId") ? server.arg("eventId") : "NONE";
 
-  // สั่งถ่ายภาพ
+  // 🟢 1. ถ่ายทิ้ง 1 รูป เพื่อเคลียร์ Buffer ภาพเก่าที่ค้างอยู่ 🟢
+  camera_fb_t * old_fb = esp_camera_fb_get();
+  if (old_fb) {
+    esp_camera_fb_return(old_fb); // คืนหน่วยความจำทันที (ทิ้งรูป)
+  }
+  
+  // หน่วงเวลานิดนึง ให้เซนเซอร์รับแสงและโฟกัสภาพใหม่
+  delay(200); 
+
+  // 🟢 2. ถ่ายรูปจริง (รูปนี้จะเป็นภาพปัจจุบันแบบ Real-time 100%) 🟢
   camera_fb_t * fb = esp_camera_fb_get();
   if (!fb) {
     Serial.println("❌ ถ่ายภาพล้มเหลว");
@@ -77,7 +86,7 @@ void handleCapture() {
 
   // คืนค่าหน่วยความจำกล้อง
   esp_camera_fb_return(fb);
-
+  
   // ตอบกลับ ESP32 หลักว่า "โอเค ถ่ายเสร็จแล้ว" (HTTP 200)
   server.send(200, "text/plain", "Capture & Upload Success");
 }
@@ -87,7 +96,7 @@ void setup() {
   
   Serial.begin(115200);
   Serial.println("\n\n--- ESP32-CAM Smart Locker ---");
-
+  
   // ตั้งค่ากล้อง
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -131,6 +140,7 @@ void setup() {
   // เชื่อมต่อ WiFi
   WiFi.begin(ssid, password);
   Serial.print("Connecting to WiFi");
+  
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
@@ -138,7 +148,7 @@ void setup() {
   Serial.println("\n✅ WiFi Connected!");
   Serial.print("🌐 ESP32-CAM IP: ");
   Serial.println(WiFi.localIP());
-
+  
   // ตั้งค่า Web Server Router
   server.on("/capture", HTTP_GET, handleCapture);
   server.begin();
@@ -146,5 +156,6 @@ void setup() {
 }
 
 void loop() {
-  server.handleClient(); // รอรับ HTTP Request ตลอดเวลา
+  server.handleClient();
+  // รอรับ HTTP Request ตลอดเวลา
 }

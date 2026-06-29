@@ -4,6 +4,7 @@
 
 #include "locker.h"
 #include "config.h"
+#include "api_client.h"  // 🟢 ต้อง include ไฟล์นี้เพื่อใช้คำสั่งส่ง Event และถ่ายรูป
 
 LockerState lockerStates[3];
 
@@ -22,6 +23,10 @@ void lockerSetup() {
   pinMode(MAG_A_PIN, INPUT);
   pinMode(MAG_B_PIN, INPUT);
   pinMode(MAG_C_PIN, INPUT);
+
+  // 🟢 4. ตั้งค่าลำโพง Buzzer
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW); // ปิดเสียงไว้ก่อนตอนเปิดเครื่อง
 
   for (int i = 0; i < 3; i++) {
     lockerStates[i].isOpen = false;
@@ -60,10 +65,50 @@ void lockerLoop() {
     }
   }
 
-  // อ่านค่า Magnetic Sensor
-  lockerStates[LOCKER_A].isOpen = (digitalRead(MAG_A_PIN) != MAG_CLOSED);
-  lockerStates[LOCKER_B].isOpen = (digitalRead(MAG_B_PIN) != MAG_CLOSED);
-  lockerStates[LOCKER_C].isOpen = (digitalRead(MAG_C_PIN) != MAG_CLOSED);
+  // อ่านค่า Magnetic Sensor ปัจจุบัน (ดึงทีเดียวทั้ง 3 ตู้)
+  bool currentOpenA = (digitalRead(MAG_A_PIN) != MAG_CLOSED);
+  bool currentOpenB = (digitalRead(MAG_B_PIN) != MAG_CLOSED);
+  bool currentOpenC = (digitalRead(MAG_C_PIN) != MAG_CLOSED);
+
+  // 🟢 ตรวจจับตู้ A
+  if (currentOpenA == true && lockerStates[LOCKER_A].isOpen == false) {
+    if (lockerStates[LOCKER_A].isUnlocking == false) {
+      Serial.println("🚨 ตู้ A โดนงัด!!");
+      digitalWrite(BUZZER_PIN, HIGH); // ร้องเตือน!
+      apiPostEvent('A', "ALERT_FORCE_OPEN", 0, "", 0, "ประตูถูกงัด!");
+      apiTriggerCamera('A', "FORCE_OPEN");
+    }
+  }
+
+  // 🟢 ตรวจจับตู้ B
+  if (currentOpenB == true && lockerStates[LOCKER_B].isOpen == false) {
+    if (lockerStates[LOCKER_B].isUnlocking == false) {
+      Serial.println("🚨 ตู้ B โดนงัด!!");
+      digitalWrite(BUZZER_PIN, HIGH); // ร้องเตือน!
+      apiPostEvent('B', "ALERT_FORCE_OPEN", 0, "", 0, "ประตูถูกงัด!");
+      apiTriggerCamera('B', "FORCE_OPEN");
+    }
+  }
+
+  // 🟢 ตรวจจับตู้ C
+  if (currentOpenC == true && lockerStates[LOCKER_C].isOpen == false) {
+    if (lockerStates[LOCKER_C].isUnlocking == false) {
+      Serial.println("🚨 ตู้ C โดนงัด!!");
+      digitalWrite(BUZZER_PIN, HIGH); // ร้องเตือน!
+      apiPostEvent('C', "ALERT_FORCE_OPEN", 0, "", 0, "ประตูถูกงัด!");
+      apiTriggerCamera('C', "FORCE_OPEN");
+    }
+  }
+
+  // 🟢 ปิดเสียงร้อง ถ้าโจรตกใจแล้วปิดประตูกลับเหมือนเดิม (หรือเราเดินมาปิด)
+  if (!currentOpenA && !currentOpenB && !currentOpenC) {
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+
+  // อัปเดตสถานะล่าสุดเก็บไว้รอบถัดไป
+  lockerStates[LOCKER_A].isOpen = currentOpenA;
+  lockerStates[LOCKER_B].isOpen = currentOpenB;
+  lockerStates[LOCKER_C].isOpen = currentOpenC;
 }
 
 bool lockerIsLockedOut(LockerId id) {

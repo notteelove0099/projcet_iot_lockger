@@ -36,6 +36,13 @@ unsigned long lastHeartbeat = 0;
 unsigned long lastEnrollCheck = 0;
 unsigned long lastRemoteUnlockCheck = 0; 
 
+// 🟢 ตัวแปรล็อคระบบ (แบบ Global นับรวมทุกตู้เพื่อความชัวร์ 100%)
+int globalPinFailCount = 0;
+unsigned long globalPinLockoutTime = 0;
+
+int fpFailCount = 0;
+unsigned long fpLockoutTime = 0;
+
 #define ENROLL_CHECK_INTERVAL_MS 10000
 #define REMOTE_UNLOCK_INTERVAL_MS 2000   
 
@@ -70,18 +77,6 @@ void loop() {
 
   if (mode != lastMode) {
     lastMode = mode;
-    Serial.print("🔄 สถานะระบบปัจจุบัน: ");
-    switch (mode) {
-      case MODE_IDLE:      
-        Serial.println("MODE_IDLE (พร้อมใช้งาน: รอสแกนนิ้ว หรือ กด 1,2,3 เพื่อเลือกตู้ A,B,C สำหรับใส่ PIN)"); 
-        break;
-      case MODE_ENTER_PIN: 
-        Serial.println("MODE_ENTER_PIN (กำลังรอผู้ใช้งานกดรหัส PIN 4 หลัก)"); 
-        break;
-      case MODE_ENROLLING: 
-        Serial.println("MODE_ENROLLING (กำลังลงทะเบียนลายนิ้วมือใหม่ให้ User)"); 
-        break;
-    }
   }
 
   if (now - lastHeartbeat >= HEARTBEAT_INTERVAL_MS) {
@@ -96,7 +91,7 @@ void loop() {
     if (apiCheckRemoteUnlock(targetLocker)) {
       LockerId id = (LockerId)(targetLocker - 'A');
       Serial.printf("🔓 ได้รับคำสั่ง Remote Unlock ช่อง %c จาก Admin\n", targetLocker);
-      doUnlock(id, "", "REMOTE_UNLOCK");
+      doUnlock(id, "", "REMOTE_UNLOCK"); 
     }
   }
 
@@ -107,31 +102,55 @@ void loop() {
 
   lockerLoop();
 
+  // 🟢 จุดดักฟัง Keypad: กดปุ๊บ ปริ้นท์บอกปั๊บ 🟢
   char key = keypadGetKey();
-  if (key) handleKeyPress(key);
+  if (key) {
+    Serial.printf("\n[KEYPAD DEBUG] ⌨️ เอานิ้วกดปุ่ม: '%c' (ขณะนี้ระบบอยู่โหมด: %d)\n", key, mode);
+    handleKeyPress(key);
+  }
 
+  // ── สแกนนิ้วมือ ──
   if (mode == MODE_IDLE) {
-    int fpId = fingerprintScan();
-    
-    if (fpId > 0) {
-      handleFingerprintAuth(fpId); 
-    } 
-    else if (fpId == -2) {
-      Serial.println("❌ สแกนนิ้วแล้ว แต่ไม่พบลายนิ้วมือนี้ในระบบ");
-      lcdError("Wrong Finger");
-      buzzerFail();
-      delay(1500);
-      lcdReady();
-    }
-    else if (fpId == -3) {
-      // Error จากเซนเซอร์
+    if (fpLockoutTime > 0 && (millis() - fpLockoutTime < 30000)) {
+       // แบน 30 วิ ปล่อยผ่าน
+    } else {
+       fpLockoutTime = 0; 
+
+       int fpId = fingerprintScan();
+       if (fpId > 0) {
+         fpFailCount = 0; 
+         handleFingerprintAuth(fpId); 
+       } 
+       else if (fpId == -2) {
+         fpFailCount++;
+         if (fpFailCount >= 5) {
+            Serial.println("🚨 สแกนนิ้วผิด 5 ครั้ง! ล็อคระบบและสั่งถ่ายภาพ");
+            fpLockoutTime = millis();
+            fpFailCount = 0;
+            
+            lcdShow("LOCKED OUT!", "Wait 30s");
+            for(int i=0; i<3; i++){ buzzerFail(); delay(200); }
+            
+            char eventId[32] = "";
+            apiPostEvent('A', "ALERT_LOCKOUT", 0, "", 0, "Fingerprint failed 5 times");
+            apiTriggerCamera('A', eventId);
+            
+            delay(2000);
+            lcdReady();
+         } else {
+            lcdError("Wrong Finger");
+            buzzerFail();
+            delay(1500);
+            lcdReady();
+         }
+       }
     }
   }
 
   delay(50);
 }
 
-// ── ตรวจ Enrollment Pending (หน่วงเวลา 30 วิแรก เช็คเว็บก่อนบังคับกด) ──
+// ── ตรวจ Enrollment Pending ───────────────────────────────────────────────
 void checkEnrollment() {
   if (!apiIsOnline()) return;
 
@@ -142,129 +161,92 @@ void checkEnrollment() {
   bool hasPending = apiCheckPendingEnroll(pendingUserId, pendingName, slot);
   if (!hasPending) return; 
 
-  Serial.printf("📋 มี User ใหม่รอลงทะเบียนนิ้ว: %s (slot %d)\n", pendingName, slot);
   mode = MODE_ENROLLING;
-
   lcdShow("Enroll:", pendingName);
   delay(1500);
   
-  // 🟢 เริ่มต้น: ยังไม่บังคับกด แต่โชว์ว่ากำลังให้เวลาเว็บจัดการ 30 วินาที
   lcdShow("Checking Web...", "Please wait 30s");
-  Serial.println("รอตรวจสอบสถานะจากหน้าเว็บ 30 วินาทีแรก...");
 
   bool isConfirmed = false;
   bool promptShown = false; 
   unsigned long waitStart = millis();
   unsigned long lastApiCheck = millis(); 
   
-  // 🟢 ขยายเวลาลูปรวมเป็น 60 วินาที (รอเว็บ 30 วิ + ให้เวลากดปุ่มหน้าตู้อีก 30 วิ)
   while (millis() - waitStart < 60000) { 
-    
-    // 🟢 ถ้าผ่านไป 30 วินาทีแล้ว ยังไม่กดยกเลิกในเว็บ ค่อยบังคับให้กด # หรือ *
     if (!promptShown && (millis() - waitStart >= 30000)) {
         promptShown = true;
         lcdShow("Press # to scan", "Press * to skip");
-        Serial.println("หมดเวลา 30 วิ ไม่พบการยกเลิกจากเว็บ -> รอให้ผู้ใช้กดปุ่มหน้าตู้...");
     }
 
     char k = keypadGetKey();
-    
-    // 🟢 อนุญาตให้กด # หรือ * ได้เฉพาะตอนที่โชว์หน้าจอให้กดแล้วเท่านั้น (ผ่าน 30 วิไปแล้ว)
     if (promptShown && k == '#') {
       lcdShow("Checking...", "Please wait");
       char tId[32]="", tName[64]="";
       uint8_t tSlot=0;
-      bool stillPending = apiCheckPendingEnroll(tId, tName, tSlot);
-      
-      if (!stillPending || strcmp(tId, pendingUserId) != 0) {
-         Serial.println("🌐 คิวถูกยกเลิกไปแล้ว! ตัดจบการเปิดเซนเซอร์");
-         lcdShow("Canceled", "from Web"); 
-         buzzerSuccess(); 
-         delay(1500);
-         mode = MODE_IDLE;
-         lcdReady();
-         return; 
+      if (!apiCheckPendingEnroll(tId, tName, tSlot) || strcmp(tId, pendingUserId) != 0) {
+         lcdShow("Canceled", "from Web"); buzzerSuccess(); delay(1500); mode = MODE_IDLE; lcdReady(); return; 
       }
       isConfirmed = true;   
       break;
-
     } else if (promptShown && k == '*') {
       break; 
     }
 
-    // 🟢 ตรวจสอบกับ Server อัตโนมัติทุก 1.5 วินาทีตลอดช่วง 60 วิ
     if (millis() - lastApiCheck >= 1500) {
       lastApiCheck = millis();
       char tId[32]="", tName[64]="";
       uint8_t tSlot=0;
-      
-      bool stillPending = apiCheckPendingEnroll(tId, tName, tSlot);
-      
-      if (!stillPending || strcmp(tId, pendingUserId) != 0) {
-         Serial.println("🌐 ตรวจพบการกดยกเลิกจากหน้าเว็บ ตัดจบการรอหน้าตู้ทันที!");
-         lcdShow("Canceled", "from Web"); 
-         buzzerSuccess(); 
-         delay(1500);
-         mode = MODE_IDLE;
-         lcdReady();
-         return; 
+      if (!apiCheckPendingEnroll(tId, tName, tSlot) || strcmp(tId, pendingUserId) != 0) {
+         lcdShow("Canceled", "from Web"); buzzerSuccess(); delay(1500); mode = MODE_IDLE; lcdReady(); return; 
       }
     }
-
     delay(50); 
   }
 
-  // ถ้าหมดเวลาลูป (60 วิ) หรือกด * ที่ตู้เอง
   if (!isConfirmed) {
-    Serial.println("⏩ ข้ามการลงทะเบียนที่หน้าตู้ (สั่งเคลียร์สถานะใน Database)");
-    
-    lcdShow("Enroll Later", "Skip for now"); 
-    buzzerSuccess(); 
+    lcdShow("Enroll Later", "Skip for now"); buzzerSuccess(); 
     apiCancelEnroll(pendingUserId);
-    
-    delay(2000);
-    mode = MODE_IDLE;
-    lcdReady();
-    return; 
+    delay(2000); mode = MODE_IDLE; lcdReady(); return; 
   }
 
   lcdShow("Place finger", "on sensor");
   buzzerSuccess(); 
 
-  bool success = fingerprintEnroll(slot);
-
-  if (success) {
+  if (fingerprintEnroll(slot)) {
     apiEnrollComplete(pendingUserId, slot);
-    lcdShow("Enrolled!", pendingName);
-    buzzerSuccess();
-    Serial.printf("✅ ลงทะเบียนนิ้ว %s slot %d สำเร็จ\n", pendingName, slot);
+    lcdShow("Enrolled!", pendingName); buzzerSuccess();
   } else {
-    lcdError("Enroll fail");
-    buzzerFail();
-    Serial.println("❌ ลงทะเบียนนิ้วไม่สำเร็จ");
+    lcdError("Enroll fail"); buzzerFail();
   }
-
-  delay(2000);
-  mode = MODE_IDLE;
-  lcdReady();
+  delay(2000); mode = MODE_IDLE; lcdReady();
 }
 
 // ── จัดการการกด Key ────────────────────────────────────────────────────────
 void handleKeyPress(char key) {
-  Serial.printf("กด: %c\n", key);
-
   if (mode == MODE_IDLE) {
     if (key == '1' || key == '2' || key == '3') {
-      if (key == '1') pinTargetLocker = 'A';
-      else if (key == '2') pinTargetLocker = 'B';
-      else if (key == '3') pinTargetLocker = 'C';
-
+      
+      // 🟢 ตรวจสอบการแบน 30 วิ (ดักไว้ตั้งแต่ยังไม่ทันให้กดรหัส)
+      if (globalPinLockoutTime > 0 && (millis() - globalPinLockoutTime < 30000)) {
+         lcdShow("LOCKED OUT!", "Wait 30s");
+         buzzerFail();
+         delay(1500);
+         lcdReady();
+         return;
+      }
+      
+      globalPinLockoutTime = 0; // ปลดแบน
+      
+      char target = (key == '1') ? 'A' : (key == '2' ? 'B' : 'C');
+      pinTargetLocker = target;
       mode            = MODE_ENTER_PIN;
       pinLength       = 0;
       memset(pinBuffer, 0, sizeof(pinBuffer));
       lcdEnterPin(pinTargetLocker);
+      Serial.println("[KEYPAD] เข้าสู่โหมดพิมพ์รหัส PIN แล้ว");
     }
     else if (key == '*') {
+      Serial.println("[KEYPAD] กดยกเลิก กลับสู่หน้าหลัก");
       lcdReady();
     }
   }
@@ -282,6 +264,7 @@ void handleKeyPress(char key) {
       mode      = MODE_IDLE;
       pinLength = 0;
       memset(pinBuffer, 0, sizeof(pinBuffer));
+      Serial.println("[KEYPAD] กดยกเลิก กลับสู่หน้าหลัก");
       lcdReady();
     }
     else if (key >= '0' && key <= '9' && pinLength < 4) {
@@ -304,22 +287,11 @@ void handleFingerprintAuth(int fpId) {
   char lockers[16]   = "";
 
   if (!apiIsOnline()) {
-    lcdError("Offline");
-    buzzerFail();
-    delay(1500);
-    lcdOffline();
-    return;
+    lcdError("Offline"); buzzerFail(); delay(1500); lcdOffline(); return;
   }
 
-  bool found = apiVerifyFingerprint(fpId, userId, lockers);
-
-  if (!found) {
-    Serial.println("ไม่พบ User จาก fingerprint");
-    lcdError("Not found");
-    buzzerFail();
-    delay(1500);
-    lcdReady();
-    return;
+  if (!apiVerifyFingerprint(fpId, userId, lockers)) {
+    lcdError("Not found"); buzzerFail(); delay(1500); lcdReady(); return;
   }
 
   bool opened = false;
@@ -328,19 +300,14 @@ void handleFingerprintAuth(int fpId) {
   while (*p) {
     if (*p == 'A' || *p == 'B' || *p == 'C') {
       LockerId id = (LockerId)(*p - 'A');
-      if (!lockerIsLockedOut(id)) {
-        doUnlock(id, userId, "FINGERPRINT");
-        opened = true;
-      }
+      doUnlock(id, userId, "FINGERPRINT");
+      opened = true;
     }
     p++;
   }
 
   if (!opened) {
-    lcdError("No access");
-    buzzerFail();
-    delay(1500);
-    lcdReady();
+    lcdError("No access"); buzzerFail(); delay(1500); lcdReady();
   }
 }
 
@@ -350,45 +317,48 @@ void handlePinAuth(char lockerId, const char* pin) {
   mode = MODE_IDLE;
 
   LockerId id = (LockerId)(lockerId - 'A');
-
-  if (lockerIsLockedOut(id)) {
-    lcdLockout();
-    buzzerFail();
-    delay(2000);
-    lcdReady();
-    return;
-  }
-
   char userId[32] = "";
 
-  bool ok = false;
-  if (apiIsOnline()) {
-    ok = apiVerifyPin(lockerId, pin, userId);
-  } else {
-    lcdError("Offline");
-    buzzerFail();
-    delay(1500);
-    lcdOffline();
-    return;
+  if (!apiIsOnline()) {
+    lcdError("Offline"); buzzerFail(); delay(1500); lcdOffline(); return;
   }
 
-  if (ok) {
-    lockerResetFail(id);
+  if (apiVerifyPin(lockerId, pin, userId)) {
+    globalPinFailCount = 0; // ตอบถูกรีเซ็ตค่า
+    lockerResetFail(id); 
     doUnlock(id, userId, "PIN");
   } else {
-    lockerRecordFail(id);
-    lcdError("Wrong PIN");
-    buzzerFail();
-    apiPostEvent(lockerId, "AUTH_FAIL", 0, userId, 0, "Wrong PIN");
-    delay(1500);
-    lcdReady();
+    globalPinFailCount++;
+
+    // 🟢 ถ้ารหัสผิดครบ 5 ครั้ง บล็อก 30 วิ ร้องเตือน และสั่งกล้องถ่ายภาพ!
+    if (globalPinFailCount >= 5) {
+       Serial.printf("🚨 รหัสผ่านตู้ %c ผิด 5 ครั้ง! ล็อค 30 วิ\n", lockerId);
+       globalPinLockoutTime = millis();
+       globalPinFailCount = 0; // รีเซ็ตเพื่อรอบถัดไป
+
+       lcdShow("LOCKED OUT!", "Wait 30s");
+       for(int i=0; i<3; i++){ buzzerFail(); delay(200); }
+
+       char eventId[32] = "";
+       apiPostEvent(lockerId, "ALERT_LOCKOUT", 0, "", 0, "PIN failed 5 times");
+       apiTriggerCamera(lockerId, eventId);
+       
+       delay(2000);
+       lcdReady();
+    } else {
+       lcdError("Wrong PIN");
+       buzzerFail();
+       apiPostEvent(lockerId, "AUTH_FAIL", 0, userId, 0, "Wrong PIN");
+       delay(1500);
+       lcdReady();
+    }
   }
 
   pinLength = 0;
   memset(pinBuffer, 0, sizeof(pinBuffer));
 }
 
-// ── Unlock ตู้ (ทำทุกขั้นตอน) ────────────────────────────────────────────
+// ── Unlock ตู้ ────────────────────────────────────────────────────────
 void doUnlock(LockerId id, const char* userId, const char* method) {
   char lockerId = 'A' + id;
   Serial.printf("✅ Unlock ช่อง %c โดย %s\n", lockerId, method);
@@ -397,7 +367,7 @@ void doUnlock(LockerId id, const char* userId, const char* method) {
   buzzerSuccess();
   lcdUnlocked(lockerId);
 
-  char eventId[32] = "";
+  char eventId[32] = ""; 
   apiPostEvent(lockerId, "UNLOCK_SUCCESS", 0, userId, 0, method);
 
   apiTriggerCamera(lockerId, eventId);

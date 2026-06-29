@@ -8,8 +8,12 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <HX711.h>
 
 static bool _online = false;
+
+// 🟢 ประกาศตัวแปรเซนเซอร์ HX711 สำหรับตู้ A
+HX711 scaleA;
 
 // ── เชื่อมต่อ WiFi ────────────────────────────────────────────────────────
 void apiSetup() {
@@ -29,6 +33,21 @@ void apiSetup() {
   } else {
     _online = false;
     Serial.println("\nไม่สามารถเชื่อมต่อ WiFi (Offline Mode)");
+  }
+
+  // 🟢 ตั้งค่าเซนเซอร์น้ำหนักตู้ A
+  scaleA.begin(HX711_A_DOUT, HX711_A_SCK);
+  Serial.println("⚖️ กำลังตั้งค่าตาชั่งตู้ A... (อย่าเพิ่งวางของในตู้)");
+  delay(1000);
+  if (scaleA.is_ready()) {
+    scaleA.tare(); // หักลบน้ำหนักตู้เปล่า
+    
+    // 📌 ใส่ตัวหาร (Calibration Factor) ที่คุณหามาได้ตรงนี้ครับ!
+    scaleA.set_scale(194247.00); 
+    
+    Serial.println("✅ เซ็ตตาชั่งตู้ A เป็น 0 และตั้งค่าหน่วยกิโลกรัมสำเร็จ!");
+  } else {
+    Serial.println("❌ หาเซนเซอร์ HX711 ไม่เจอ! โปรดเช็คสายไฟ (DOUT=13, SCK=15)");
   }
 }
 
@@ -54,7 +73,7 @@ static int httpPost(const char* path, const String& body, String& response) {
   return code;
 }
 
-// ── Heartbeat ──────────────────────────────────────────────────────────────
+// ── Heartbeat (ส่งสถานะและน้ำหนักแบบ Real-time) ──────────────────────────────
 void apiSendHeartbeat() {
   if (!apiIsOnline()) return;
 
@@ -62,6 +81,27 @@ void apiSendHeartbeat() {
   JsonArray arr = doc["lockers"].to<JsonArray>();
 
   const char names[3] = { 'A', 'B', 'C' };
+
+// 🟢 อ่านค่าน้ำหนักเป็น "กิโลกรัม" (get_units)
+  float weightA = 0.0;
+  if (scaleA.is_ready()) {
+    long rawTest = scaleA.get_value(1); 
+    weightA = scaleA.get_units(5);      
+    
+    // 🟢 เพิ่มระบบตัดเศษ (Deadzone) ตรงนี้ครับ!
+    // ถ้าน้ำหนักแกว่งอยู่ในช่วงไม่เกิน 0.03 กิโลกรัม (30 กรัม) ให้ถือว่าเป็น 0 
+    if (abs(weightA) < 0.03) {
+      weightA = 0.00;
+    }
+
+    Serial.print("⚖️ ค่าดิบเซนเซอร์: ");
+    Serial.print(rawTest);
+    Serial.print("  |  น้ำหนักส่งไป Web: ");
+    Serial.print(weightA);
+    Serial.println(" กิโลกรัม");
+  } else {
+    Serial.println("⚠️ ตาชั่งไม่ตอบสนอง (เช็คสายไฟ DOUT/SCK ด่วน!)");
+  }
 
   for (int i = 0; i < 3; i++) {
     JsonObject o = arr.add<JsonObject>();
@@ -71,8 +111,16 @@ void apiSendHeartbeat() {
     // Magnetic Sensor: true = ประตูเปิดอยู่
     o["doorOpen"] = lockerStates[i].isOpen;
 
-    // Weight Sensor (HX711): แค่เช็คว่ามีของหรือไม่
-    o["hasItem"] = false; 
+    if (i == 0) {
+      // 🟢 ปัดเศษทศนิยมให้เหลือ 2 ตำแหน่ง (เช่น 1.25) จะได้ดูสวยงามบนหน้าเว็บ
+      o["weight"] = round(weightA * 100.0) / 100.0; 
+      
+      // 🟢 ตัดสินใจว่า "มีของ" ก็ต่อเมื่อน้ำหนักเกิน 0.05 กก. (50 กรัม) เพื่อกันค่าแกว่งจากลมพัด
+      o["hasItem"] = (abs(weightA) > 0.05);
+    } else {
+      o["weight"] = 0;
+      o["hasItem"] = false;    
+    }
   }
 
   String body, resp;
@@ -151,13 +199,10 @@ bool apiCheckPendingEnroll(char* outUserId, char* outName, uint8_t& outSlot) {
   if (!apiIsOnline()) return false;
 
   HTTPClient http;
-  
-  // 🟢 เคล็ดลับกัน Cache: เติม ?t=เวลาปัจจุบัน เพื่อให้ URL เปลี่ยนไปเรื่อยๆ Router จะได้ไม่จำค่าเก่า
   String url = String(SERVER_URL) + "/api/esp32/pending-enroll?t=" + String(millis());
-  
   http.begin(url);
   http.addHeader("x-api-key", ESP32_API_KEY);
-  http.setTimeout(3000);
+  http.setTimeout(5000);
 
   int code = http.GET();
   if (code != 200) { http.end(); return false; }
